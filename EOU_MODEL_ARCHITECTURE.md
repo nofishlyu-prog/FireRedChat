@@ -756,6 +756,621 @@ def random_delete(text, rate=0.05):
 
 ---
 
+## 训练数据构造方法
+
+### 对话数据收集
+
+```python
+# 对话数据收集工具
+class DialogueDataCollector:
+    def __init__(self):
+        self.dialogues = []
+    
+    def collect_from_chat_logs(self, log_dir):
+        """从聊天记录收集对话"""
+        import json
+        
+        for log_file in Path(log_dir).glob("*.json"):
+            with open(log_file, "r", encoding="utf-8") as f:
+                chat_log = json.load(f)
+            
+            # 提取对话轮次
+            for i, message in enumerate(chat_log["messages"]):
+                if message["role"] == "user":
+                    # 判断是否结束
+                    is_eou = self.judge_eou_manual(message, chat_log, i)
+                    
+                    self.dialogues.append({
+                        "chat_ctx": [{"role": "user", "content": message["content"]}],
+                        "label": 1 if is_eou else 0,
+                        "source": str(log_file),
+                        "context": self.get_context(chat_log, i)
+                    })
+        
+        return self.dialogues
+    
+    def judge_eou_manual(self, message, chat_log, index):
+        """
+        人工判断是否轮次结束
+        
+        规则:
+        1. 有明确结束标点 (。！？)
+        2. 语义完整
+        3. 后续有 assistant 回复
+        """
+        text = message["content"].strip()
+        
+        # 规则 1: 结束标点
+        if text and text[-1] in "。！？!?":
+            return True
+        
+        # 规则 2: 疑问词结尾
+        question_words = ["吗", "呢", "什么", "哪里", "怎么", "为什么"]
+        if any(text.endswith(w) for w in question_words):
+            return True
+        
+        # 规则 3: 明显未结束
+        unfinished_markers = ["因为", "所以", "但是", "而且", "如果", "虽然"]
+        if any(text.endswith(w) for w in unfinished_markers):
+            return False
+        
+        # 规则 4: 后续有回复
+        if index + 1 < len(chat_log["messages"]):
+            next_msg = chat_log["messages"][index + 1]
+            if next_msg["role"] == "assistant":
+                return True
+        
+        # 默认判断
+        return len(text) > 10  # 长句倾向于结束
+    
+    def get_context(self, chat_log, index):
+        """获取上下文"""
+        # 取前 2 轮对话作为上下文
+        context = []
+        for i in range(max(0, index - 2), index):
+            context.append({
+                "role": chat_log["messages"][i]["role"],
+                "content": chat_log["messages"][i]["content"]
+            })
+        
+        return context
+    
+    def save(self, output_file):
+        """保存数据"""
+        with open(output_file, "w", encoding="utf-8") as f:
+            for dialogue in self.dialogues:
+                f.write(json.dumps(dialogue, ensure_ascii=False) + "\n")
+        
+        print(f"已保存 {len(self.dialogues)} 条对话")
+```
+
+### 标注规范
+
+```python
+# EOU 标注规范
+EOU_ANNOTATION_GUIDELINES = {
+    "label_1_eou": """
+    标记为 1 (轮次结束) 的情况:
+    
+    1. 完整陈述句
+       - "我觉得挺好的。"
+       - "今天天气不错"
+    
+    2. 疑问句
+       - "你在哪里？"
+       - "这是你的吗"
+    
+    3. 感叹句
+       - "太棒了！"
+       - "真好看啊"
+    
+    4. 明确结束词
+       - "就这样"
+       - "没了"
+       - "说完了"
+    
+    5. 命令/请求
+       - "请帮我查一下"
+       - "告诉我答案"
+    """,
+    
+    "label_0_not_eou": """
+    标记为 0 (未结束) 的情况:
+    
+    1. 从句/连词结尾
+       - "因为..."
+       - "但是..."
+       - "如果..."
+    
+    2. 语气词结尾
+       - "我觉得吧..."
+       - "那个..."
+       - "呃..."
+    
+    3. 列举中
+       - "第一、第二..."
+       - "首先..."
+    
+    4. 明显停顿
+       - "让我想想..."
+       - "怎么说呢..."
+    
+    5. 不完整句
+       - "我想要..."
+       - "你能不能..."
+    """
+}
+
+# 标注工具
+class EOUAnnotationTool:
+    def __init__(self):
+        self.annotations = []
+    
+    def create_interface(self):
+        """创建标注界面"""
+        with gr.Blocks() as demo:
+            gr.Markdown("# EOU 数据标注工具")
+            
+            # 显示 Guidelines
+            with gr.Accordion("标注规范"):
+                gr.Markdown(EOU_ANNOTATION_GUIDELINES["label_1_eou"])
+                gr.Markdown(EOU_ANNOTATION_GUIDELINES["label_0_not_eou"])
+            
+            # 对话上下文
+            context_display = gr.JSON(label="对话上下文")
+            
+            # 当前消息
+            message_display = gr.Textbox(label="当前消息", lines=2)
+            
+            # 标注按钮
+            with gr.Row():
+                eou_btn = gr.Button("轮次结束 (1)", variant="primary")
+                not_eou_btn = gr.Button("未结束 (0)")
+                unclear_btn = gr.Button("不确定")
+            
+            # 进度
+            progress = gr.Textbox(label="进度")
+            
+            # 事件绑定
+            eou_btn.click(fn=self.annotate, inputs=[1], outputs=[progress])
+            not_eou_btn.click(fn=self.annotate, inputs=[0], outputs=[progress])
+        
+        return demo
+    
+    def annotate(self, label):
+        """标注"""
+        annotation = {
+            "chat_ctx": self.current_context,
+            "label": label,
+            "annotator": self.annotator_id,
+            "timestamp": datetime.now().isoformat()
+        }
+        
+        self.annotations.append(annotation)
+        
+        # 保存
+        with open("eou_annotations.jsonl", "a", encoding="utf-8") as f:
+            f.write(json.dumps(annotation, ensure_ascii=False) + "\n")
+        
+        return f"已标注：{len(self.annotations)} 条"
+```
+
+### 数据增强方法
+
+```python
+# EOU 数据增强
+class EOUDataAugmentation:
+    def __init__(self):
+        pass
+    
+    def augment(self, text, label, augment_type="all"):
+        """
+        数据增强 (保持标签不变)
+        
+        Args:
+            text: 原始文本
+            label: EOU 标签
+            augment_type: 增强类型
+        
+        Returns:
+            list: 增强后的样本
+        """
+        augmented = []
+        
+        if augment_type in ["all", "reorder"]:
+            # 1. 语序重排 (保持语义)
+            augmented.extend(self.reorder_sentence(text, label))
+        
+        if augment_type in ["all", "synonym"]:
+            # 2. 同义替换
+            augmented.extend(self.replace_synonyms(text, label))
+        
+        if augment_type in ["all", "back_translation"]:
+            # 3. 回译
+            augmented.extend(self.back_translate(text, label))
+        
+        if augment_type in ["all", "noise"]:
+            # 4. 添加噪音 (模拟 ASR 错误)
+            augmented.extend(self.add_noise(text, label))
+        
+        return augmented
+    
+    def reorder_sentence(self, text, label):
+        """语序重排"""
+        # 简单实现：交换状语位置
+        augmented = []
+        
+        # "我今天很高兴" -> "今天我很高兴"
+        if "我" in text and "今天" in text:
+            reordered = text.replace("我今天", "今天我")
+            augmented.append({"text": reordered, "label": label})
+        
+        return augmented
+    
+    def replace_synonyms(self, text, label):
+        """同义替换"""
+        augmented = []
+        
+        synonyms = {
+            "很好": ["不错", "挺好", "可以"],
+            "喜欢": ["爱", "中意", "欣赏"],
+            "觉得": ["感觉", "认为", "以为"]
+        }
+        
+        for word, syns in synonyms.items():
+            if word in text:
+                for syn in syns:
+                    new_text = text.replace(word, syn, 1)
+                    augmented.append({"text": new_text, "label": label})
+        
+        return augmented
+    
+    def back_translate(self, text, label):
+        """回译 (中→英→中)"""
+        # 需要使用翻译 API
+        # 这里只是示例
+        augmented = []
+        
+        # 伪代码
+        # english = translate_zh_to_en(text)
+        # chinese_back = translate_en_to_zh(english)
+        # augmented.append({"text": chinese_back, "label": label})
+        
+        return augmented
+    
+    def add_noise(self, text, label):
+        """添加噪音 (模拟 ASR 错误)"""
+        augmented = []
+        
+        # 1. 同音字替换
+        homophones = {
+            "的": ["得", "地"],
+            "是": ["事", "市"],
+            "在": ["再", "载"]
+        }
+        
+        for char, replacements in homophones.items():
+            if char in text:
+                for rep in replacements:
+                    noisy_text = text.replace(char, rep, 1)
+                    augmented.append({"text": noisy_text, "label": label})
+        
+        return augmented
+
+# 使用示例
+aug = EOUDataAugmentation()
+augmented_samples = aug.augment("我觉得挺好的", label=1)
+# 1 条 → 5-10 条
+```
+
+---
+
+## 评测数据构造方法
+
+### 测试集划分
+
+```python
+# EOU 测试集划分
+def create_eou_test_set(annotations, output_dir):
+    """
+    创建分层测试集
+    
+    按以下维度分层:
+    - 句子长度 (短/中/长)
+    - 句子类型 (陈述/疑问/感叹)
+    - 上下文长度 (0/1/2 轮)
+    - 领域 (闲聊/任务/专业)
+    """
+    
+    # 分组
+    groups = {
+        "short_neutral": [],
+        "medium_neutral": [],
+        "long_neutral": [],
+        "question": [],
+        "exclamation": [],
+        "with_context": [],
+        "casual": [],
+        "task_oriented": []
+    }
+    
+    for ann in annotations:
+        text = ann["chat_ctx"][-1]["content"] if ann["chat_ctx"] else ""
+        
+        # 按长度分组
+        if len(text) < 10:
+            groups["short_neutral"].append(ann)
+        elif len(text) < 30:
+            groups["medium_neutral"].append(ann)
+        else:
+            groups["long_neutral"].append(ann)
+        
+        # 按句子类型分组
+        if text and text[-1] in "？!?":
+            groups["question"].append(ann)
+        elif text and text[-1] in "！!":
+            groups["exclamation"].append(ann)
+        
+        # 按上下文分组
+        if len(ann.get("context", [])) > 0:
+            groups["with_context"].append(ann)
+        
+        # 按领域分组
+        if "请" in text or "帮" in text:
+            groups["task_oriented"].append(ann)
+        else:
+            groups["casual"].append(ann)
+    
+    # 每组抽取样本
+    test_set = []
+    for group_name, group_samples in groups.items():
+        n_samples = min(50, len(group_samples))
+        selected = random.sample(group_samples, n_samples)
+        
+        for s in selected:
+            s["scenario"] = group_name
+            test_set.append(s)
+    
+    # 保存
+    with open(f"{output_dir}/eou_test.jsonl", "w", encoding="utf-8") as f:
+        for s in test_set:
+            f.write(json.dumps(s, ensure_ascii=False) + "\n")
+    
+    print(f"测试集总计：{len(test_set)} 样本")
+    for name in groups:
+        count = sum(1 for s in test_set if s["scenario"] == name)
+        print(f"  {name}: {count}")
+    
+    return test_set
+```
+
+---
+
+## 评测方法
+
+### 核心指标
+
+```python
+# EOU 评测指标
+class EOUMetrics:
+    def __init__(self):
+        pass
+    
+    def calculate_all(self, references, predictions, probabilities=None):
+        """
+        计算所有指标
+        
+        Args:
+            references: 真实标签列表 (0/1)
+            predictions: 预测标签列表 (0/1)
+            probabilities: 预测概率列表 (可选)
+        
+        Returns:
+            dict: 各项指标
+        """
+        from sklearn.metrics import (
+            accuracy_score, precision_score, recall_score, 
+            f1_score, roc_auc_score, confusion_matrix
+        )
+        
+        # 1. 基础指标
+        accuracy = accuracy_score(references, predictions)
+        precision = precision_score(references, predictions)
+        recall = recall_score(references, predictions)
+        f1 = f1_score(references, predictions)
+        
+        # 2. AUC (如有概率)
+        auc = None
+        if probabilities is not None:
+            auc = roc_auc_score(references, probabilities)
+        
+        # 3. 混淆矩阵
+        tn, fp, fn, tp = confusion_matrix(references, predictions).ravel()
+        
+        # 4. 衍生指标
+        false_positive_rate = fp / (fp + tn) if (fp + tn) > 0 else 0
+        false_negative_rate = fn / (fn + tp) if (fn + tp) > 0 else 0
+        
+        # 5. 对话影响指标
+        dialogue_impact = self.calculate_dialogue_impact(
+            references, predictions
+        )
+        
+        return {
+            "accuracy": accuracy * 100,
+            "precision": precision * 100,
+            "recall": recall * 100,
+            "f1": f1 * 100,
+            "auc": auc * 100 if auc else None,
+            "false_positive_rate": false_positive_rate * 100,
+            "false_negative_rate": false_negative_rate * 100,
+            "confusion_matrix": {
+                "tp": int(tp),
+                "fp": int(fp),
+                "tn": int(tn),
+                "fn": int(fn)
+            },
+            "dialogue_impact": dialogue_impact
+        }
+    
+    def calculate_dialogue_impact(self, references, predictions):
+        """
+        计算对对话的影响
+        
+        指标:
+        - 过早回复率 (FN): 用户未说完就回复
+        - 过晚回复率 (FP): 用户说完了等待过久
+        """
+        # 过早回复 (用户未结束，系统认为结束)
+        premature = sum(1 for ref, pred in zip(references, predictions) 
+                       if ref == 0 and pred == 1)
+        
+        # 过晚回复 (用户已结束，系统认为未结束)
+        delayed = sum(1 for ref, pred in zip(references, predictions) 
+                     if ref == 1 and pred == 0)
+        
+        total = len(references)
+        
+        return {
+            "premature_response_rate": premature / total * 100,
+            "delayed_response_rate": delayed / total * 100
+        }
+
+# 使用示例
+metrics = EOUMetrics()
+results = metrics.calculate_all(
+    references=[1, 0, 1, 1, 0],
+    predictions=[1, 0, 0, 1, 0],
+    probabilities=[0.9, 0.2, 0.4, 0.8, 0.3]
+)
+print(f"F1: {results['f1']:.2f}%")
+print(f"过早回复率：{results['dialogue_impact']['premature_response_rate']:.2f}%")
+```
+
+### 分场景评测
+
+```python
+# 分场景 EOU 评测
+class ScenarioEOUEvaluator:
+    def __init__(self, eou_model):
+        self.eou_model = eou_model
+        self.metrics = EOUMetrics()
+    
+    def evaluate_by_scenario(self, test_set):
+        """分场景评测"""
+        results = {}
+        
+        # 按场景分组
+        scenarios = {}
+        for sample in test_set:
+            scenario = sample.get("scenario", "unknown")
+            if scenario not in scenarios:
+                scenarios[scenario] = []
+            scenarios[scenario].append(sample)
+        
+        # 每个场景单独评测
+        for scenario_name, samples in scenarios.items():
+            print(f"\n评测场景：{scenario_name}")
+            
+            references = [s["label"] for s in samples]
+            predictions = []
+            probabilities = []
+            
+            # 批量预测
+            for sample in samples:
+                prob = await self.eou_model.predict_end_of_turn(
+                    sample["chat_ctx"]
+                )
+                probabilities.append(prob)
+                predictions.append(1 if prob > 0.5 else 0)
+            
+            # 计算指标
+            scenario_results = self.metrics.calculate_all(
+                references, predictions, probabilities
+            )
+            
+            results[scenario_name] = scenario_results
+            
+            print(f"  F1: {scenario_results['f1']:.2f}%")
+            print(f"  过早回复率：{scenario_results['dialogue_impact']['premature_response_rate']:.2f}%")
+        
+        return results
+    
+    def generate_report(self, results, output_file):
+        """生成评测报告"""
+        report = {
+            "summary": {
+                "avg_f1": np.mean([r["f1"] for r in results.values()]),
+                "avg_premature_rate": np.mean([
+                    r["dialogue_impact"]["premature_response_rate"] 
+                    for r in results.values()
+                ])
+            },
+            "by_scenario": results,
+            "worst_scenario": min(
+                results.items(), 
+                key=lambda x: x[1]["f1"]
+            ),
+            "best_scenario": max(
+                results.items(), 
+                key=lambda x: x[1]["f1"]
+            )
+        }
+        
+        with open(output_file, "w", encoding="utf-8") as f:
+            json.dump(report, f, ensure_ascii=False, indent=2)
+        
+        return report
+```
+
+### 端到端对话评测
+
+```python
+# 端到端对话评测
+class EndToEndDialogueEvaluator:
+    """
+    在真实对话系统中评测 EOU 效果
+    """
+    
+    def __init__(self, dialogue_system):
+        self.dialogue_system = dialogue_system
+    
+    def evaluate(self, test_scenarios):
+        """
+        端到端评测
+        
+        Args:
+            test_scenarios: 测试场景列表
+        """
+        results = []
+        
+        for scenario in test_scenarios:
+            # 模拟对话
+            conversation = self.simulate_conversation(scenario)
+            
+            # 收集指标
+            result = {
+                "scenario": scenario["name"],
+                "total_turns": conversation["turns"],
+                "premature_responses": conversation["premature"],
+                "delayed_responses": conversation["delayed"],
+                "user_satisfaction": conversation["satisfaction"],
+                "avg_response_time": conversation["avg_response_time"]
+            }
+            
+            results.append(result)
+        
+        return results
+    
+    def simulate_conversation(self, scenario):
+        """模拟对话"""
+        # 实现对话模拟逻辑
+        # 记录所有指标
+        pass
+```
+
+---
+
 ## 推理流程
 
 ### 完整推理链路

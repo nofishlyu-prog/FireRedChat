@@ -771,6 +771,727 @@ def speed_perturb(mel, speed_factor):
 
 ---
 
+## 训练数据构造方法
+
+### 音频录制规范
+
+```python
+# 录音质量标准
+RECORDING_SPECS = {
+    "sample_rate": 24000,      # 24kHz
+    "bit_depth": 16,           # 16bit
+    "channels": 1,             # 单声道
+    "snr_min": 30,             # 信噪比 >30dB
+    "room_rt60_max": 0.3,      # 混响时间 <300ms
+    "peak_level": -3,          # 峰值电平 -3dBFS
+}
+
+# 录音脚本示例
+class TTSRecordingScript:
+    def __init__(self):
+        self.sentences = []
+    
+    def load_script(self, script_file):
+        """加载录音文本"""
+        with open(script_file, "r", encoding="utf-8") as f:
+            self.sentences = [line.strip() for line in f if line.strip()]
+        
+        # 检查覆盖率
+        self.check_coverage()
+        
+        return self.sentences
+    
+    def check_coverage(self):
+        """检查音素覆盖率"""
+        all_phonemes = set()
+        
+        for sentence in self.sentences:
+            phonemes = self.text_to_phonemes(sentence)
+            all_phonemes.update(phonemes)
+        
+        # 检查是否覆盖所有中文音素
+        required_phonemes = set(['a', 'o', 'e', 'i', 'u', 'ü', ...])  # 完整音素表
+        missing = required_phonemes - all_phonemes
+        
+        if missing:
+            print(f"警告：缺少音素覆盖：{missing}")
+            print("建议补充包含这些音素的句子")
+        
+        return len(missing) == 0
+    
+    def text_to_phonemes(self, text):
+        """文本转音素 (用于覆盖率检查)"""
+        from pypinyin import lazy_pinyin
+        
+        phonemes = []
+        for char in text:
+            if '\u4e00' <= char <= '\u9fff':
+                pinyin = lazy_pinyin(char)[0]
+                phonemes.extend(list(pinyin))
+            else:
+                phonemes.append(char)
+        
+        return phonemes
+    
+    def generate_recording_list(self, output_file):
+        """生成录音列表"""
+        with open(output_file, "w", encoding="utf-8") as f:
+            for i, sentence in enumerate(self.sentences):
+                f.write(f"{i:04d}\t{sentence}\n")
+        
+        return output_file
+```
+
+### 音频预处理
+
+```python
+# 音频预处理管道
+class TTSAudioPreprocessor:
+    def __init__(self, target_sr=24000):
+        self.target_sr = target_sr
+    
+    def preprocess(self, audio_file, text, output_dir):
+        """
+        预处理音频
+        
+        步骤:
+        1. 质量检查
+        2. 修剪静音
+        3. 音量归一化
+        4. 重采样
+        5. 保存
+        """
+        # 1. 加载音频
+        audio, sr = sf.read(audio_file)
+        
+        # 2. 质量检查
+        quality = self.check_quality(audio, sr)
+        if not quality["passed"]:
+            print(f"质量检查失败：{quality['issues']}")
+            return None
+        
+        # 3. 修剪静音
+        audio = self.trim_silence(audio, sr)
+        
+        # 4. 音量归一化
+        audio = self.normalize_volume(audio, target_db=-3)
+        
+        # 5. 重采样
+        if sr != self.target_sr:
+            audio = self.resample(audio, sr, self.target_sr)
+        
+        # 6. 保存
+        output_file = f"{output_dir}/{Path(audio_file).stem}_processed.wav"
+        sf.write(output_file, audio, self.target_sr)
+        
+        # 7. 生成元数据
+        metadata = {
+            "original_file": str(audio_file),
+            "processed_file": output_file,
+            "text": text,
+            "duration": len(audio) / self.target_sr,
+            "sample_rate": self.target_sr,
+            "quality": quality
+        }
+        
+        with open(f"{output_file}.meta.json", "w") as f:
+            json.dump(metadata, f, ensure_ascii=False, indent=2)
+        
+        return metadata
+    
+    def check_quality(self, audio, sr):
+        """音频质量检查"""
+        issues = []
+        passed = True
+        
+        # 检查峰值
+        peak = np.max(np.abs(audio))
+        if peak > 0.99:
+            issues.append("clipping_detected")
+            passed = False
+        
+        # 检查信噪比
+        snr = self.estimate_snr(audio)
+        if snr < 30:
+            issues.append(f"low_snr:{snr:.1f}dB")
+            passed = False
+        
+        # 检查时长
+        duration = len(audio) / sr
+        if duration < 0.5:
+            issues.append("too_short")
+            passed = False
+        
+        if duration > 15:
+            issues.append("too_long")
+            passed = False
+        
+        return {
+            "passed": passed,
+            "issues": issues,
+            "peak": peak,
+            "snr": snr,
+            "duration": duration
+        }
+    
+    def trim_silence(self, audio, sr, threshold=0.01, min_silence=0.1):
+        """修剪首尾静音"""
+        # 计算能量
+        energy = np.abs(audio)
+        
+        # 找到语音开始
+        start = 0
+        for i in range(len(energy)):
+            if energy[i] > threshold:
+                start = max(0, i - int(min_silence * sr))
+                break
+        
+        # 找到语音结束
+        end = len(audio)
+        for i in range(len(energy) - 1, -1, -1):
+            if energy[i] > threshold:
+                end = min(len(audio), i + int(min_silence * sr))
+                break
+        
+        return audio[start:end]
+    
+    def normalize_volume(self, audio, target_db=-3):
+        """音量归一化"""
+        # 计算当前 RMS
+        rms = np.sqrt(np.mean(audio ** 2))
+        
+        # 计算目标 RMS
+        target_rms = 10 ** (target_db / 20)
+        
+        # 缩放
+        scale = target_rms / rms
+        normalized = audio * scale
+        
+        # 限制峰值
+        normalized = np.clip(normalized, -0.99, 0.99)
+        
+        return normalized
+    
+    def estimate_snr(self, audio):
+        """估算信噪比"""
+        # 简单实现：假设首尾 100ms 为静音
+        noise_start = audio[:1600]  # 100ms @ 16kHz
+        noise_power = np.mean(noise_start ** 2)
+        
+        signal_power = np.mean(audio ** 2)
+        
+        if noise_power == 0:
+            return 999
+        
+        snr = 10 * np.log10(signal_power / noise_power)
+        return snr
+```
+
+### 文本 - 音频对齐检查
+
+```python
+# 文本 - 音频对齐验证
+class TextAudioAlignChecker:
+    def __init__(self, asr_model):
+        self.asr_model = asr_model
+    
+    def check_alignment(self, audio_file, reference_text):
+        """
+        检查文本和音频是否对齐
+        
+        方法：用 ASR 识别音频，与参考文本比对
+        """
+        # ASR 识别
+        result = self.asr_model.transcribe([audio_file])
+        recognized_text = result[0]["text"]
+        
+        # 计算编辑距离
+        edits = jiwer.compute_measures(reference_text, recognized_text)
+        
+        # 错误率
+        cer = (edits["substitutions"] + edits["deletions"] + edits["insertions"]) / \
+              (len(reference_text) + 1e-6)
+        
+        # 判断
+        passed = cer < 0.1  # CER < 10%
+        
+        return {
+            "passed": passed,
+            "cer": cer * 100,
+            "recognized": recognized_text,
+            "reference": reference_text,
+            "edits": edits
+        }
+    
+    def batch_check(self, metadata_file):
+        """批量检查"""
+        results = []
+        
+        with open(metadata_file, "r") as f:
+            for line in f:
+                meta = json.loads(line)
+                
+                result = self.check_alignment(
+                    meta["processed_file"],
+                    meta["text"]
+                )
+                
+                result["file"] = meta["processed_file"]
+                results.append(result)
+        
+        # 统计
+        passed = sum(1 for r in results if r["passed"])
+        print(f"总计：{len(results)}, 通过：{passed}, 通过率：{passed/len(results)*100:.1f}%")
+        
+        # 保存未通过的
+        failed = [r for r in results if not r["passed"]]
+        with open("alignment_failed.jsonl", "w") as f:
+            for r in failed:
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+        
+        return results
+```
+
+---
+
+## 评测数据构造方法
+
+### 测试集设计
+
+```python
+# TTS 测试集构造
+class TTSTestSetBuilder:
+    def __init__(self):
+        self.test_sentences = []
+    
+    def build_scenarios(self):
+        """构建评测场景"""
+        scenarios = [
+            {
+                "name": "neutral",
+                "description": "中性陈述句",
+                "sentences": [
+                    "今天天气不错。",
+                    "我现在在北京。",
+                    "他今年二十岁。"
+                ],
+                "min_samples": 20
+            },
+            {
+                "name": "question",
+                "description": "疑问句",
+                "sentences": [
+                    "你在哪里？",
+                    "这是你的书吗？",
+                    "什么时候出发？"
+                ],
+                "min_samples": 20
+            },
+            {
+                "name": "exclamation",
+                "description": "感叹句",
+                "sentences": [
+                    "太棒了！",
+                    "真好看啊！",
+                    "好厉害！"
+                ],
+                "min_samples": 20
+            },
+            {
+                "name": "numbers",
+                "description": "数字",
+                "sentences": [
+                    "我的电话是 13800138000。",
+                    "价格是 99.5 元。",
+                    "现在是 2024 年 1 月 15 日。"
+                ],
+                "min_samples": 20
+            },
+            {
+                "name": "english",
+                "description": "中英混合",
+                "sentences": [
+                    "请用 Python 写一个 Hello World。",
+                    "我的邮箱是 test@example.com。",
+                    "访问 https://example.com 获取更多信息。"
+                ],
+                "min_samples": 20
+            },
+            {
+                "name": "long_sentence",
+                "description": "长句 (>50 字)",
+                "sentences": [
+                    "这是一个非常长的句子，用来测试 TTS 系统在处理长文本时的表现，包括气息控制和韵律连贯性。"
+                ],
+                "min_samples": 10
+            }
+        ]
+        
+        return scenarios
+    
+    def create_test_set(self, output_file):
+        """创建测试集"""
+        scenarios = self.build_scenarios()
+        
+        test_set = []
+        for scenario in scenarios:
+            for sentence in scenario["sentences"]:
+                test_set.append({
+                    "text": sentence,
+                    "scenario": scenario["name"],
+                    "description": scenario["description"]
+                })
+        
+        # 保存
+        with open(output_file, "w", encoding="utf-8") as f:
+            json.dump(test_set, f, ensure_ascii=False, indent=2)
+        
+        print(f"测试集总计：{len(test_set)} 条")
+        
+        return test_set
+```
+
+### 主观评测 (MOS) 数据准备
+
+```python
+# MOS 评测数据准备
+class MOSDataPreparation:
+    def __init__(self):
+        self.samples = []
+    
+    def prepare_mos_test(self, tts_outputs, output_dir):
+        """
+        准备 MOS 主观评测
+        
+        Args:
+            tts_outputs: TTS 生成的音频列表
+            output_dir: 输出目录
+        """
+        # 创建 HTML 评测界面
+        self.create_html_interface(tts_outputs, output_dir)
+        
+        # 创建评分表
+        self.create_rating_sheet(tts_outputs, output_dir)
+    
+    def create_html_interface(self, tts_outputs, output_dir):
+        """创建 HTML 评测界面"""
+        html = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>TTS MOS 评测</title>
+    <style>
+        .sample { margin: 20px 0; padding: 15px; border: 1px solid #ccc; }
+        .rating { margin: 10px 0; }
+        .comment { width: 100%; height: 60px; }
+    </style>
+</head>
+<body>
+    <h1>TTS 主观评测 (MOS)</h1>
+    <p>请对每个样本的语音质量进行评分 (1-5 分)</p>
+    <ul>
+        <li>5 分：完美，无瑕疵</li>
+        <li>4 分：良好，有小问题</li>
+        <li>3 分：一般，可接受</li>
+        <li>2 分：较差，影响理解</li>
+        <li>1 分：很差，无法理解</li>
+    </ul>
+"""
+        
+        for i, sample in enumerate(tts_outputs):
+            html += f"""
+    <div class="sample">
+        <h3>样本 {i+1}</h3>
+        <p>文本：{sample['text']}</p>
+        <audio controls>
+            <source src="{sample['audio_file']}" type="audio/wav">
+        </audio>
+        <div class="rating">
+            <label>评分：</label>
+            <select name="sample_{i}_rating">
+                <option value="5">5 分</option>
+                <option value="4">4 分</option>
+                <option value="3">3 分</option>
+                <option value="2">2 分</option>
+                <option value="1">1 分</option>
+            </select>
+        </div>
+        <textarea class="comment" name="sample_{i}_comment" placeholder="备注 (可选问题描述)..."></textarea>
+    </div>
+"""
+        
+        html += """
+    <button onclick="submit()">提交评分</button>
+    <script>
+        function submit() {
+            // 收集评分并提交
+            alert("评分已提交");
+        }
+    </script>
+</body>
+</html>
+"""
+        
+        with open(f"{output_dir}/mos_test.html", "w", encoding="utf-8") as f:
+            f.write(html)
+    
+    def create_rating_sheet(self, tts_outputs, output_dir):
+        """创建 Excel 评分表"""
+        import pandas as pd
+        
+        data = {
+            "样本 ID": range(1, len(tts_outputs) + 1),
+            "文本": [s["text"] for s in tts_outputs],
+            "场景": [s["scenario"] for s in tts_outputs],
+            "MOS 评分": [""] * len(tts_outputs),
+            "问题类型": [""] * len(tts_outputs),
+            "备注": [""] * len(tts_outputs)
+        }
+        
+        df = pd.DataFrame(data)
+        df.to_excel(f"{output_dir}/mos_rating_sheet.xlsx", index=False)
+```
+
+---
+
+## 评测方法
+
+### 客观指标
+
+```python
+# TTS 客观评测指标
+class TTSMetrics:
+    def __init__(self):
+        pass
+    
+    def calculate_all(self, reference_audio, synthesized_audio):
+        """
+        计算所有客观指标
+        
+        Args:
+            reference_audio: 真实录音 (如有)
+            synthesized_audio: TTS 合成音频
+        
+        Returns:
+            dict: 各项指标
+        """
+        metrics = {}
+        
+        # 1. 声学特征相似度
+        metrics.update(self.calculate_acoustic_similarity(
+            reference_audio, synthesized_audio
+        ))
+        
+        # 2. 韵律相似度
+        metrics.update(self.calculate_prosody_similarity(
+            reference_audio, synthesized_audio
+        ))
+        
+        # 3.  intelligibility (可懂度)
+        metrics.update(self.calculate_intelligibility(
+            synthesized_audio
+        ))
+        
+        return metrics
+    
+    def calculate_acoustic_similarity(self, ref_audio, syn_audio):
+        """声学特征相似度"""
+        # 提取 Mel 频谱
+        ref_mel = self.extract_mel(ref_audio)
+        syn_mel = self.extract_mel(syn_audio)
+        
+        # 调整长度
+        min_len = min(len(ref_mel), len(syn_mel))
+        ref_mel = ref_mel[:min_len]
+        syn_mel = syn_mel[:min_len]
+        
+        # 计算 MSE
+        mel_mse = np.mean((ref_mel - syn_mel) ** 2)
+        
+        # 计算余弦相似度
+        mel_cosine = np.dot(ref_mel.flatten(), syn_mel.flatten()) / \
+                     (np.linalg.norm(ref_mel.flatten()) * np.linalg.norm(syn_mel.flatten()))
+        
+        return {
+            "mel_mse": mel_mse,
+            "mel_cosine_similarity": mel_cosine
+        }
+    
+    def calculate_prosody_similarity(self, ref_audio, syn_audio):
+        """韵律相似度 (F0, 时长)"""
+        # 提取基频 (F0)
+        ref_f0 = self.extract_f0(ref_audio)
+        syn_f0 = self.extract_f0(syn_audio)
+        
+        # F0 相关系数
+        min_len = min(len(ref_f0), len(syn_f0))
+        f0_corr = np.corrcoef(ref_f0[:min_len], syn_f0[:min_len])[0, 1]
+        
+        # F0 RMSE
+        f0_rmse = np.sqrt(np.mean((ref_f0[:min_len] - syn_f0[:min_len]) ** 2))
+        
+        return {
+            "f0_correlation": f0_corr if not np.isnan(f0_corr) else 0,
+            "f0_rmse": f0_rmse
+        }
+    
+    def calculate_intelligibility(self, syn_audio):
+        """
+        可懂度 (使用 ASR 识别率间接评估)
+        
+        需要先有参考文本
+        """
+        # 这个方法需要 ASR 服务
+        # 这里只是示例
+        return {
+            "intelligibility_note": "需要使用 ASR 识别率评估"
+        }
+    
+    def extract_mel(self, audio, sr=24000):
+        """提取 Mel 频谱"""
+        mel_extractor = torchaudio.transforms.MelSpectrogram(
+            sample_rate=sr,
+            n_fft=1024,
+            n_mels=80,
+        )
+        
+        audio_tensor = torch.FloatTensor(audio).unsqueeze(0)
+        mel = mel_extractor(audio_tensor)
+        
+        return torch.log(torch.clamp(mel, min=1e-5)).squeeze(0).transpose(0, 1).numpy()
+    
+    def extract_f0(self, audio, sr=24000):
+        """提取基频 (F0)"""
+        import librosa
+        
+        f0, voiced_flag, voiced_probs = librosa.pyin(
+            audio,
+            fmin=librosa.note_to_hz('C2'),
+            fmax=librosa.note_to_hz('C7'),
+            sr=sr
+        )
+        
+        # 填充未定义值
+        f0 = np.nan_to_num(f0, nan=0.0)
+        
+        return f0
+
+# 使用示例
+metrics = TTSMetrics()
+results = metrics.calculate_all(
+    reference_audio="reference.wav",
+    synthesized_audio="synthesized.wav"
+)
+print(f"Mel 相似度：{results['mel_cosine_similarity']:.4f}")
+```
+
+### 主观评测 (MOS) 分析
+
+```python
+# MOS 数据分析
+class MOSAnalyzer:
+    def __init__(self):
+        self.ratings = []
+    
+    def load_ratings(self, ratings_file):
+        """加载评分数据"""
+        import pandas as pd
+        
+        df = pd.read_excel(ratings_file)
+        self.ratings = df.to_dict("records")
+        
+        return self.ratings
+    
+    def calculate_mos(self):
+        """计算平均 MOS 分数"""
+        ratings = [r["MOS 评分"] for r in self.ratings if r["MOS 评分"]]
+        
+        if not ratings:
+            return None
+        
+        mos = np.mean(ratings)
+        mos_std = np.std(ratings)
+        mos_ci = 1.96 * mos_std / np.sqrt(len(ratings))  # 95% 置信区间
+        
+        return {
+            "mos": mos,
+            "std": mos_std,
+            "ci_95": mos_ci,
+            "count": len(ratings)
+        }
+    
+    def analyze_by_scenario(self):
+        """分场景分析"""
+        scenarios = {}
+        
+        for r in self.ratings:
+            scenario = r.get("场景", "unknown")
+            if scenario not in scenarios:
+                scenarios[scenario] = []
+            
+            if r["MOS 评分"]:
+                scenarios[scenario].append(r["MOS 评分"])
+        
+        results = {}
+        for scenario, ratings in scenarios.items():
+            results[scenario] = {
+                "mos": np.mean(ratings),
+                "std": np.std(ratings),
+                "count": len(ratings)
+            }
+        
+        return results
+    
+    def analyze_problem_types(self):
+        """分析问题类型"""
+        problem_types = {}
+        
+        for r in self.ratings:
+            problem = r.get("问题类型", "")
+            if problem:
+                problem_types[problem] = problem_types.get(problem, 0) + 1
+        
+        return problem_types
+    
+    def generate_report(self, output_file):
+        """生成评测报告"""
+        mos_stats = self.calculate_mos()
+        scenario_stats = self.analyze_by_scenario()
+        problem_stats = self.analyze_problem_types()
+        
+        report = f"""# TTS MOS 评测报告
+
+## 总体表现
+
+- **平均 MOS**: {mos_stats['mos']:.2f} ± {mos_stats['ci_95']:.2f} (95% CI)
+- **标准差**: {mos_stats['std']:.2f}
+- **样本数**: {mos_stats['count']}
+
+## 分场景表现
+
+| 场景 | MOS | 标准差 | 样本数 |
+|------|-----|--------|--------|
+"""
+        
+        for scenario, stats in scenario_stats.items():
+            report += f"| {scenario} | {stats['mos']:.2f} | {stats['std']:.2f} | {stats['count']} |\n"
+        
+        report += f"""
+## 主要问题
+
+"""
+        
+        for problem, count in sorted(problem_stats.items(), key=lambda x: -x[1]):
+            report += f"- {problem}: {count} 次\n"
+        
+        with open(output_file, "w", encoding="utf-8") as f:
+            f.write(report)
+        
+        return report
+```
+
+---
+
 ## 推理流程
 
 ### 完整推理链路

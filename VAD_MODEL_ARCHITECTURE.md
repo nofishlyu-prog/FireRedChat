@@ -588,6 +588,744 @@ total_loss = vad_loss + 0.5 * speaker_loss
 
 ---
 
+## 训练数据构造方法
+
+### RTTM 标注格式
+
+```python
+# RTTM (Rich Transcription Time Marked) 格式
+# SPEAKER <文件 ID> <通道 ID> <起始时间> <时长> <NA> <NA> <说话人 ID> <NA>
+
+# 示例:
+# SPEAKER recording1 1 0.000 5.230 <NA> <NA> speaker1 <NA>
+# NON-SPEECH recording1 1 5.230 1.270 <NA> <NA> <NA> <NA>
+# SPEAKER recording1 1 6.500 3.120 <NA> <NA> speaker1 <NA>
+
+class RTTMAnnotation:
+    """RTTM 标注处理"""
+    
+    @staticmethod
+    def parse_line(line):
+        """解析 RTTM 行"""
+        parts = line.strip().split()
+        
+        return {
+            "type": parts[0],  # SPEAKER / NON-SPEECH
+            "file_id": parts[1],
+            "channel_id": parts[2],
+            "start_time": float(parts[3]),
+            "duration": float(parts[4]),
+            "speaker_id": parts[6] if parts[6] != "<NA>" else None
+        }
+    
+    @staticmethod
+    def to_segments(rttm_file):
+        """转换为语音段列表"""
+        segments = []
+        
+        with open(rttm_file, "r") as f:
+            for line in f:
+                if line.startswith("SPEAKER"):
+                    ann = RTTMAnnotation.parse_line(line)
+                    segments.append({
+                        "file": ann["file_id"],
+                        "start": ann["start_time"],
+                        "end": ann["start_time"] + ann["duration"],
+                        "speaker": ann["speaker_id"],
+                        "type": "speech"
+                    })
+                elif line.startswith("NON-SPEECH"):
+                    ann = RTTMAnnotation.parse_line(line)
+                    segments.append({
+                        "file": ann["file_id"],
+                        "start": ann["start_time"],
+                        "end": ann["start_time"] + ann["duration"],
+                        "type": "non-speech"
+                    })
+        
+        return segments
+    
+    @staticmethod
+    def create_rttm(segments, output_file):
+        """从语音段创建 RTTM 文件"""
+        with open(output_file, "w") as f:
+            for seg in segments:
+                if seg["type"] == "speech":
+                    line = f"SPEAKER {seg['file']} 1 {seg['start']:.3f} {seg['end']-seg['start']:.3f} <NA> <NA> {seg.get('speaker', 'spk1')} <NA>\n"
+                else:
+                    line = f"NON-SPEECH {seg['file']} 1 {seg['start']:.3f} {seg['end']-seg['start']:.3f} <NA> <NA> <NA> <NA>\n"
+                f.write(line)
+```
+
+### 标注工具
+
+```python
+# VAD 标注工具 (基于音频波形)
+import gradio as gr
+import librosa
+import numpy as np
+
+class VADAnnotationTool:
+    def __init__(self):
+        self.annotations = []
+    
+    def create_interface(self):
+        """创建标注界面"""
+        with gr.Blocks() as demo:
+            gr.Markdown("# VAD 数据标注工具")
+            
+            # 音频波形显示
+            waveform = gr.Plot(label="音频波形")
+            
+            with gr.Row():
+                # 播放控制
+                audio = gr.Audio(type="filepath", label="音频")
+                
+                # 标注区域
+                with gr.Column():
+                    # 时间轴滑块
+                    start_slider = gr.Slider(
+                        minimum=0, maximum=100, value=0,
+                        label="语音开始时间 (秒)"
+                    )
+                    end_slider = gr.Slider(
+                        minimum=0, maximum=100, value=100,
+                        label="语音结束时间 (秒)"
+                    )
+                    
+                    # 说话人 ID
+                    speaker_id = gr.Textbox(
+                        label="说话人 ID",
+                        placeholder="如：spk001"
+                    )
+                    
+                    # 按钮
+                    with gr.Row():
+                        add_btn = gr.Button("添加语音段", variant="primary")
+                        clear_btn = gr.Button("清空")
+                        save_btn = gr.Button("保存标注")
+            
+            # 标注列表
+            annotation_list = gr.JSON(label="当前标注")
+            
+            # 事件绑定
+            add_btn.click(
+                fn=self.add_segment,
+                inputs=[audio, start_slider, end_slider, speaker_id],
+                outputs=[annotation_list]
+            )
+            
+            save_btn.click(
+                fn=self.save_annotations,
+                inputs=[annotation_list],
+                outputs=[gr.Textbox(label="状态")]
+            )
+        
+        return demo
+    
+    def add_segment(self, audio_file, start, end, speaker_id):
+        """添加语音段"""
+        segment = {
+            "file": audio_file,
+            "start": float(start),
+            "end": float(end),
+            "speaker": speaker_id or "spk1",
+            "type": "speech"
+        }
+        
+        self.annotations.append(segment)
+        
+        return self.annotations
+    
+    def save_annotations(self, annotations):
+        """保存为 RTTM 格式"""
+        output_file = "annotations.rttm"
+        
+        RTTMAnnotation.create_rttm(annotations, output_file)
+        
+        return f"已保存到 {output_file}"
+
+# 启动工具
+if __name__ == "__main__":
+    tool = VADAnnotationTool()
+    demo = tool.create_interface()
+    demo.launch()
+```
+
+### 数据增强方法
+
+```python
+# VAD 专用数据增强
+class VADDataAugmentation:
+    def __init__(self, sample_rate=16000):
+        self.sample_rate = sample_rate
+    
+    def augment(self, audio, segments, augment_type="all"):
+        """
+        数据增强 (保持标注同步)
+        
+        Args:
+            audio: 音频数组
+            segments: RTTM 语音段列表
+            augment_type: 增强类型
+        
+        Returns:
+            augmented_audio, augmented_segments
+        """
+        if augment_type == "all":
+            audio, segments = self.add_noise(audio, segments)
+            audio, segments = self.add_reverb(audio, segments)
+            audio, segments = self.speed_perturb(audio, segments)
+        
+        return audio, segments
+    
+    def add_noise(self, audio, segments, snr_range=(10, 20)):
+        """添加背景噪音 (不改变标注时间)"""
+        # 加载噪音
+        noise = self.load_noise()
+        
+        # 调整长度
+        if len(noise) > len(audio):
+            noise = noise[:len(audio)]
+        else:
+            noise = np.pad(noise, (0, len(audio) - len(noise)))
+        
+        # 计算 SNR
+        snr = np.random.uniform(*snr_range)
+        audio_power = np.sum(audio ** 2) / len(audio)
+        noise_power = np.sum(noise ** 2) / len(noise)
+        noise_scaled = noise * np.sqrt(audio_power / (noise_power * (10 ** (snr / 10))))
+        
+        # 混合
+        noisy_audio = audio + noise_scaled
+        noisy_audio = noisy_audio / np.max(np.abs(noisy_audio))
+        
+        # 标注不变
+        return noisy_audio, segments
+    
+    def add_reverb(self, audio, segments):
+        """添加混响 (不改变标注时间)"""
+        rir = self.load_rir()
+        
+        # 卷积
+        reverberated = signal.convolve(audio, rir, mode="full")
+        reverberated = reverberated[:len(audio)]
+        reverberated = reverberated / np.max(np.abs(reverberated))
+        
+        return reverberated, segments
+    
+    def speed_perturb(self, audio, segments, speed_factor=None):
+        """
+        速度扰动 (需要调整标注时间)
+        
+        Args:
+            speed_factor: 速度因子 (0.9, 1.0, 1.1)
+        """
+        if speed_factor is None:
+            speed_factor = np.random.choice([0.9, 1.0, 1.1])
+        
+        if speed_factor == 1.0:
+            return audio, segments
+        
+        # 重采样
+        length = int(len(audio) / speed_factor)
+        indices = np.linspace(0, len(audio) - 1, length).astype(int)
+        perturbed_audio = audio[indices]
+        
+        # 调整标注时间
+        perturbed_segments = []
+        for seg in segments:
+            perturbed_seg = seg.copy()
+            perturbed_seg["start"] = seg["start"] / speed_factor
+            perturbed_seg["end"] = seg["end"] / speed_factor
+            perturbed_segments.append(perturbed_seg)
+        
+        return perturbed_audio, perturbed_segments
+    
+    def load_noise(self):
+        """加载噪音 (MUSAN 数据集)"""
+        noise_files = [
+            "musan/noise/free-sound/1234.wav",
+            "musan/noise/free-sound/5678.wav"
+        ]
+        noise_file = np.random.choice(noise_files)
+        noise, _ = sf.read(noise_file)
+        return noise
+    
+    def load_rir(self):
+        """加载房间冲激响应 (RIRS_NOISES 数据集)"""
+        rir_files = [
+            "RIRS_NOISES/simulated_rirs/mediumroom/0001.wav",
+            "RIRS_NOISES/simulated_rirs/largeroom/0002.wav"
+        ]
+        rir_file = np.random.choice(rir_files)
+        rir, _ = sf.read(rir_file)
+        return rir
+```
+
+### 数据质量检查
+
+```python
+# VAD 数据质量检查
+class VADQualityChecker:
+    def __init__(self):
+        self.issues = []
+    
+    def check_rttm(self, rttm_file, audio_file):
+        """检查 RTTM 标注质量"""
+        # 加载音频
+        audio, sr = sf.read(audio_file)
+        duration = len(audio) / sr
+        
+        # 加载 RTTM
+        segments = RTTMAnnotation.to_segments(rttm_file)
+        
+        # 检查 1: 时间范围
+        for seg in segments:
+            if seg["start"] < 0:
+                self.issues.append({
+                    "file": rttm_file,
+                    "issue": "negative_start",
+                    "segment": seg
+                })
+            
+            if seg["end"] > duration:
+                self.issues.append({
+                    "file": rttm_file,
+                    "issue": "exceed_duration",
+                    "segment": seg,
+                    "audio_duration": duration
+                })
+        
+        # 检查 2: 语音段重叠
+        speech_segments = [s for s in segments if s["type"] == "speech"]
+        for i, seg1 in enumerate(speech_segments):
+            for seg2 in speech_segments[i+1:]:
+                if self.segments_overlap(seg1, seg2):
+                    self.issues.append({
+                        "file": rttm_file,
+                        "issue": "overlapping_segments",
+                        "segment1": seg1,
+                        "segment2": seg2
+                    })
+        
+        # 检查 3: 最小语音段长度
+        for seg in segments:
+            seg_duration = seg["end"] - seg["start"]
+            if seg_duration < 0.1:  # 小于 100ms
+                self.issues.append({
+                    "file": rttm_file,
+                    "issue": "too_short_segment",
+                    "segment": seg,
+                    "duration": seg_duration
+                })
+        
+        # 检查 4: 语音/非语音比例
+        total_speech = sum(s["end"] - s["start"] for s in segments if s["type"] == "speech")
+        speech_ratio = total_speech / duration
+        
+        if speech_ratio < 0.1:
+            self.issues.append({
+                "file": rttm_file,
+                "issue": "low_speech_ratio",
+                "ratio": speech_ratio
+            })
+        
+        if speech_ratio > 0.95:
+            self.issues.append({
+                "file": rttm_file,
+                "issue": "high_speech_ratio",
+                "ratio": speech_ratio
+            })
+        
+        return self.issues
+    
+    def segments_overlap(self, seg1, seg2):
+        """检查两个语音段是否重叠"""
+        return not (seg1["end"] <= seg2["start"] or seg2["end"] <= seg1["start"])
+    
+    def generate_report(self):
+        """生成质量报告"""
+        from collections import Counter
+        
+        issue_types = Counter(issue["issue"] for issue in self.issues)
+        
+        return {
+            "total_issues": len(self.issues),
+            "by_type": dict(issue_types),
+            "details": self.issues
+        }
+```
+
+---
+
+## 评测数据构造方法
+
+### 测试集划分
+
+```python
+# VAD 测试集划分
+def create_vad_test_set(annotations, output_dir):
+    """
+    创建 VAD 测试集
+    
+    按场景分层抽样:
+    - 安静环境
+    - 轻度噪音
+    - 中度噪音
+    - 重度噪音
+    - 混响环境
+    - 多人对话
+    """
+    
+    # 按噪音水平分组
+    groups = {
+        "clean": [],
+        "noise_slight": [],
+        "noise_moderate": [],
+        "noise_high": [],
+        "reverb": [],
+        "multi_speaker": []
+    }
+    
+    for ann in annotations:
+        if ann.get("snr", 999) > 30:
+            groups["clean"].append(ann)
+        elif ann.get("snr", 999) > 20:
+            groups["noise_slight"].append(ann)
+        elif ann.get("snr", 999) > 15:
+            groups["noise_moderate"].append(ann)
+        else:
+            groups["noise_high"].append(ann)
+        
+        if ann.get("reverb", False):
+            groups["reverb"].append(ann)
+        
+        if ann.get("num_speakers", 1) > 1:
+            groups["multi_speaker"].append(ann)
+    
+    # 每组抽取 50 个样本
+    test_set = []
+    for group_name, group_samples in groups.items():
+        n_samples = min(50, len(group_samples))
+        selected = random.sample(group_samples, n_samples)
+        
+        for s in selected:
+            s["scenario"] = group_name
+            test_set.append(s)
+    
+    # 保存
+    with open(f"{output_dir}/vad_test.jsonl", "w") as f:
+        for s in test_set:
+            f.write(json.dumps(s, ensure_ascii=False) + "\n")
+    
+    print(f"测试集总计：{len(test_set)} 样本")
+    for name in groups:
+        count = sum(1 for s in test_set if s["scenario"] == name)
+        print(f"  {name}: {count}")
+    
+    return test_set
+```
+
+### 评测场景设计
+
+```python
+# VAD 评测场景
+class VADEvaluationScenarios:
+    def __init__(self):
+        self.scenarios = [
+            {
+                "name": "clean",
+                "description": "安静环境，无背景噪音",
+                "snr_min": 30,
+                "reverb": False,
+                "min_samples": 50
+            },
+            {
+                "name": "noise_cafe",
+                "description": "咖啡厅环境噪音",
+                "snr_min": 15,
+                "snr_max": 25,
+                "noise_type": "cafe",
+                "min_samples": 50
+            },
+            {
+                "name": "noise_street",
+                "description": "街道环境噪音",
+                "snr_min": 10,
+                "snr_max": 20,
+                "noise_type": "street",
+                "min_samples": 50
+            },
+            {
+                "name": "reverb_room",
+                "description": "房间混响",
+                "reverb": True,
+                "rt60": (0.3, 0.8),  # 混响时间
+                "min_samples": 50
+            },
+            {
+                "name": "overlapping_speech",
+                "description": "重叠语音",
+                "num_speakers": 2,
+                "overlap_ratio": (0.1, 0.5),
+                "min_samples": 30
+            },
+            {
+                "name": "short_utterance",
+                "description": "短语音 (<500ms)",
+                "duration_max": 0.5,
+                "min_samples": 50
+            },
+            {
+                "name": "long_utterance",
+                "description": "长语音 (>5s)",
+                "duration_min": 5.0,
+                "min_samples": 50
+            }
+        ]
+```
+
+---
+
+## 评测方法
+
+### 核心指标
+
+```python
+# VAD 评测指标
+class VADMetrics:
+    def __init__(self, frame_size=0.01):  # 10ms 帧
+        self.frame_size = frame_size
+    
+    def calculate_all(self, reference_segments, hypothesis_segments, audio_duration):
+        """
+        计算所有 VAD 指标
+        
+        Args:
+            reference_segments: 真实标注语音段
+            hypothesis_segments: 预测语音段
+            audio_duration: 音频总时长
+        
+        Returns:
+            dict: 各项指标
+        """
+        # 转换为帧级标签
+        ref_frames = self.segments_to_frames(reference_segments, audio_duration)
+        hyp_frames = self.segments_to_frames(hypothesis_segments, audio_duration)
+        
+        # 1. 帧级指标
+        frame_accuracy = np.mean(ref_frames == hyp_frames)
+        
+        # 2. 混淆矩阵
+        tp = np.sum((ref_frames == 1) & (hyp_frames == 1))
+        fp = np.sum((ref_frames == 0) & (hyp_frames == 1))
+        tn = np.sum((ref_frames == 0) & (hyp_frames == 0))
+        fn = np.sum((ref_frames == 1) & (hyp_frames == 0))
+        
+        # 3. 衍生指标
+        precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+        recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+        f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
+        
+        # 4. 段级指标
+        segment_metrics = self.calculate_segment_metrics(
+            reference_segments, hypothesis_segments
+        )
+        
+        return {
+            "frame_accuracy": frame_accuracy * 100,
+            "precision": precision * 100,
+            "recall": recall * 100,
+            "f1": f1 * 100,
+            "segment_detection_rate": segment_metrics["detection_rate"] * 100,
+            "segment_false_alarm_rate": segment_metrics["false_alarm_rate"] * 100,
+            "boundary_precision": segment_metrics["boundary_precision"],
+            "boundary_recall": segment_metrics["boundary_recall"]
+        }
+    
+    def segments_to_frames(self, segments, duration):
+        """将语音段转换为帧级标签"""
+        n_frames = int(duration / self.frame_size)
+        frames = np.zeros(n_frames, dtype=bool)
+        
+        for seg in segments:
+            start_frame = int(seg["start"] / self.frame_size)
+            end_frame = int(seg["end"] / self.frame_size)
+            frames[start_frame:end_frame] = True
+        
+        return frames
+    
+    def calculate_segment_metrics(self, ref_segments, hyp_segments, tolerance=0.2):
+        """
+        段级指标 (允许边界误差)
+        
+        Args:
+            ref_segments: 真实语音段
+            hyp_segments: 预测语音段
+            tolerance: 边界容差 (秒)
+        """
+        detected = 0
+        false_alarms = 0
+        boundary_errors = []
+        
+        for hyp in hyp_segments:
+            matched = False
+            
+            for ref in ref_segments:
+                # 检查是否匹配 (考虑容差)
+                if (abs(hyp["start"] - ref["start"]) <= tolerance and
+                    abs(hyp["end"] - ref["end"]) <= tolerance):
+                    detected += 1
+                    matched = True
+                    
+                    # 记录边界误差
+                    boundary_errors.append(abs(hyp["start"] - ref["start"]))
+                    boundary_errors.append(abs(hyp["end"] - ref["end"]))
+                    break
+            
+            if not matched:
+                false_alarms += 1
+        
+        n_ref = len(ref_segments)
+        detection_rate = detected / n_ref if n_ref > 0 else 0
+        false_alarm_rate = false_alarms / n_ref if n_ref > 0 else 0
+        
+        avg_boundary_error = np.mean(boundary_errors) if boundary_errors else 0
+        
+        return {
+            "detection_rate": detection_rate,
+            "false_alarm_rate": false_alarm_rate,
+            "boundary_precision": 1.0 - (avg_boundary_error / tolerance),
+            "boundary_recall": detection_rate
+        }
+
+# 使用示例
+metrics = VADMetrics(frame_size=0.01)
+results = metrics.calculate_all(
+    reference_segments=[{"start": 0.5, "end": 3.2}],
+    hypothesis_segments=[{"start": 0.6, "end": 3.1}],
+    audio_duration=5.0
+)
+print(f"F1: {results['f1']:.2f}%")
+```
+
+### 分场景评测
+
+```python
+# 分场景 VAD 评测
+class ScenarioVADEvaluator:
+    def __init__(self, vad_model):
+        self.vad_model = vad_model
+        self.metrics = VADMetrics()
+    
+    def evaluate_by_scenario(self, test_set):
+        """分场景评测"""
+        results = {}
+        
+        # 按场景分组
+        scenarios = {}
+        for sample in test_set:
+            scenario = sample.get("scenario", "unknown")
+            if scenario not in scenarios:
+                scenarios[scenario] = []
+            scenarios[scenario].append(sample)
+        
+        # 每个场景单独评测
+        for scenario_name, samples in scenarios.items():
+            print(f"\n评测场景：{scenario_name}")
+            
+            scenario_metrics = []
+            
+            for sample in samples:
+                # 运行 VAD
+                hyp_segments = self.vad_model.detect(sample["audio"])
+                
+                # 计算指标
+                sample_metrics = self.metrics.calculate_all(
+                    sample["reference_segments"],
+                    hyp_segments,
+                    sample["duration"]
+                )
+                
+                scenario_metrics.append(sample_metrics)
+            
+            # 平均
+            avg_metrics = {
+                key: np.mean([m[key] for m in scenario_metrics])
+                for key in scenario_metrics[0].keys()
+            }
+            
+            results[scenario_name] = avg_metrics
+            
+            print(f"  F1: {avg_metrics['f1']:.2f}%")
+            print(f"  检出率：{avg_metrics['segment_detection_rate']:.2f}%")
+        
+        return results
+```
+
+### 人工校验工具
+
+```python
+# VAD 结果人工校验
+class VADVerificationTool:
+    def __init__(self):
+        self.corrections = []
+    
+    def create_interface(self):
+        """创建校验界面"""
+        with gr.Blocks() as demo:
+            gr.Markdown("# VAD 结果人工校验")
+            
+            with gr.Row():
+                # 波形显示
+                waveform_plot = gr.Plot(label="音频波形 + VAD 结果")
+                
+                # 控制
+                with gr.Column():
+                    audio = gr.Audio(type="filepath")
+                    
+                    # 修正滑块
+                    start_correct = gr.Slider(
+                        minimum=0, maximum=100,
+                        label="修正开始时间"
+                    )
+                    end_correct = gr.Slider(
+                        minimum=0, maximum=100,
+                        label="修正结束时间"
+                    )
+                    
+                    # 按钮
+                    submit_btn = gr.Button("提交修正", variant="primary")
+            
+            # 统计
+            stats = gr.JSON(label="修正统计")
+        
+        return demo
+    
+    def plot_with_vad(self, audio_file, vad_segments):
+        """绘制波形和 VAD 结果"""
+        audio, sr = sf.read(audio_file)
+        
+        fig, ax = plt.subplots(figsize=(12, 4))
+        
+        # 波形
+        time = np.arange(len(audio)) / sr
+        ax.plot(time, audio, alpha=0.5, label="Audio")
+        
+        # VAD 标注
+        for seg in vad_segments:
+            ax.axvspan(seg["start"], seg["end"], alpha=0.3, color="red", label="VAD")
+        
+        ax.set_xlabel("Time (s)")
+        ax.set_ylabel("Amplitude")
+        ax.legend()
+        
+        return fig
+```
+
+---
+
 ## 流式推理流程
 
 ### VADStream 状态机

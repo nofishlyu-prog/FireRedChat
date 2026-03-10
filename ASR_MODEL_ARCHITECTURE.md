@@ -543,6 +543,951 @@ scaler.scale(loss).backward()
 
 ---
 
+## 训练数据构造方法
+
+### 数据来源与采集
+
+#### 1. 公开数据集
+
+```python
+# 数据下载脚本示例
+import os
+import subprocess
+
+DATASETS = {
+    "aishell1": {
+        "url": "https://www.openslr.org/resources/33/data_aishell.tgz",
+        "size": "178h",
+        "language": "zh"
+    },
+    "aishell2": {
+        "url": "https://www.openslr.org/resources/33/data_aishell2.tgz",
+        "size": "1000h",
+        "language": "zh"
+    },
+    "librispeech": {
+        "url": "https://www.openslr.org/resources/12/test-clean.tar.gz",
+        "size": "960h",
+        "language": "en"
+    }
+}
+
+def download_dataset(name, output_dir):
+    """下载公开数据集"""
+    dataset = DATASETS[name]
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # 下载
+    subprocess.run([
+        "wget", "-c", dataset["url"],
+        "-O", f"{output_dir}/{name}.tar.gz"
+    ])
+    
+    # 解压
+    subprocess.run([
+        "tar", "-xzf", f"{output_dir}/{name}.tar.gz",
+        "-C", output_dir
+    ])
+```
+
+#### 2. 自采数据流程
+
+```python
+# 数据采集脚本
+import pyaudio
+import wave
+import json
+from datetime import datetime
+
+class DataCollector:
+    def __init__(self, sample_rate=16000):
+        self.sample_rate = sample_rate
+    
+    def record(self, duration=10, filename="recording.wav"):
+        """录制音频"""
+        p = pyaudio.PyAudio()
+        
+        stream = p.open(
+            format=pyaudio.paInt16,
+            channels=1,
+            rate=self.sample_rate,
+            input=True,
+            frames_per_buffer=1024
+        )
+        
+        frames = []
+        for _ in range(0, int(self.sample_rate / 1024 * duration)):
+            data = stream.read(1024)
+            frames.append(data)
+        
+        stream.stop_stream()
+        stream.close()
+        
+        # 保存 WAV
+        wf = wave.open(filename, 'wb')
+        wf.setnchannels(1)
+        wf.setsampwidth(p.get_sample_size(pyaudio.paInt16))
+        wf.setframerate(self.sample_rate)
+        wf.writeframes(b''.join(frames))
+        wf.close()
+        
+        return filename
+    
+    def create_annotation(self, audio_file, text, speaker_id, noise_level="clean"):
+        """创建标注文件"""
+        annotation = {
+            "audio": audio_file,
+            "text": text,
+            "speaker_id": speaker_id,
+            "duration": self.get_duration(audio_file),
+            "sample_rate": self.sample_rate,
+            "noise_level": noise_level,
+            "language": self.detect_language(text),
+            "timestamp": datetime.now().isoformat()
+        }
+        
+        # 保存为 JSONL
+        with open("annotations.jsonl", "a", encoding="utf-8") as f:
+            f.write(json.dumps(annotation, ensure_ascii=False) + "\n")
+        
+        return annotation
+    
+    def get_duration(self, audio_file):
+        """获取音频时长"""
+        with wave.open(audio_file, 'rb') as wf:
+            frames = wf.getnframes()
+            rate = wf.getframerate()
+            return frames / float(rate)
+    
+    def detect_language(self, text):
+        """检测语言 (中/英)"""
+        chinese_chars = sum(1 for c in text if '\u4e00' <= c <= '\u9fff')
+        ratio = chinese_chars / len(text) if len(text) > 0 else 0
+        return "zh" if ratio > 0.5 else "en"
+```
+
+### 数据标注流程
+
+#### 1. 人工标注工具
+
+```python
+# 标注工具界面 (基于 Gradio)
+import gradio as gr
+import wave
+import json
+
+class ASRAnnotationTool:
+    def __init__(self):
+        self.annotations = []
+    
+    def create_interface(self):
+        """创建标注界面"""
+        with gr.Blocks() as demo:
+            gr.Markdown("# ASR 数据标注工具")
+            
+            with gr.Row():
+                # 音频播放器
+                audio = gr.Audio(type="filepath", label="音频")
+                
+                # 标注输入
+                with gr.Column():
+                    text_input = gr.Textbox(
+                        label="转录文本",
+                        placeholder="请输入听到的内容...",
+                        lines=3
+                    )
+                    
+                    speaker_id = gr.Textbox(
+                        label="说话人 ID",
+                        placeholder="如：spk001"
+                    )
+                    
+                    noise_level = gr.Dropdown(
+                        choices=["clean", "slight", "moderate", "high"],
+                        label="噪音等级"
+                    )
+                    
+                    submit_btn = gr.Button("提交标注", variant="primary")
+                    skip_btn = gr.Button("跳过")
+            
+            # 进度显示
+            progress = gr.Textbox(label="进度", value="0/0")
+            
+            # 事件绑定
+            submit_btn.click(
+                fn=self.save_annotation,
+                inputs=[audio, text_input, speaker_id, noise_level],
+                outputs=[progress]
+            )
+            
+            skip_btn.click(
+                fn=self.skip,
+                outputs=[progress]
+            )
+        
+        return demo
+    
+    def save_annotation(self, audio, text, speaker_id, noise_level):
+        """保存标注"""
+        annotation = {
+            "audio": audio,
+            "text": text,
+            "speaker_id": speaker_id,
+            "noise_level": noise_level,
+            "annotator": "human",
+            "timestamp": datetime.now().isoformat()
+        }
+        
+        self.annotations.append(annotation)
+        
+        # 保存到文件
+        with open("annotations.jsonl", "a", encoding="utf-8") as f:
+            f.write(json.dumps(annotation, ensure_ascii=False) + "\n")
+        
+        return f"已保存：{len(self.annotations)} 条"
+    
+    def skip(self):
+        """跳过"""
+        return f"跳过，当前：{len(self.annotations)} 条"
+
+# 启动工具
+if __name__ == "__main__":
+    tool = ASRAnnotationTool()
+    demo = tool.create_interface()
+    demo.launch(server_name="0.0.0.0", server_port=7860)
+```
+
+#### 2. 自动标注 + 人工校验
+
+```python
+# 半自动标注流程
+class SemiAutoAnnotation:
+    def __init__(self, asr_model):
+        self.asr_model = asr_model
+        self.confidence_threshold = 0.8
+    
+    def auto_annotate(self, audio_file):
+        """自动标注"""
+        # ASR 识别
+        result = self.asr_model.transcribe(audio_file)
+        
+        annotation = {
+            "audio": audio_file,
+            "text": result["text"],
+            "confidence": result["confidence"],
+            "auto_annotated": True,
+            "needs_review": result["confidence"] < self.confidence_threshold
+        }
+        
+        return annotation
+    
+    def batch_process(self, audio_files, output_file):
+        """批量处理"""
+        annotations = []
+        
+        for audio_file in audio_files:
+            ann = self.auto_annotate(audio_file)
+            annotations.append(ann)
+        
+        # 保存
+        with open(output_file, "w", encoding="utf-8") as f:
+            for ann in annotations:
+                f.write(json.dumps(ann, ensure_ascii=False) + "\n")
+        
+        # 统计
+        needs_review = sum(1 for a in annotations if a["needs_review"])
+        print(f"总计：{len(annotations)}, 需复核：{needs_review}")
+        
+        return annotations
+```
+
+### 数据增强方法
+
+```python
+# 数据增强管道
+import numpy as np
+import soundfile as sf
+from scipy import signal
+
+class DataAugmentation:
+    def __init__(self, sample_rate=16000):
+        self.sample_rate = sample_rate
+    
+    def augment(self, audio, text, augment_type="all"):
+        """数据增强"""
+        augmented_samples = []
+        
+        if augment_type in ["all", "noise"]:
+            # 1. 噪音添加
+            augmented_samples.extend(self.add_noise(audio, text))
+        
+        if augment_type in ["all", "reverb"]:
+            # 2. 混响添加
+            augmented_samples.extend(self.add_reverb(audio, text))
+        
+        if augment_type in ["all", "speed"]:
+            # 3. 速度扰动
+            augmented_samples.extend(self.speed_perturb(audio, text))
+        
+        if augment_type in ["all", "volume"]:
+            # 4. 音量扰动
+            augmented_samples.extend(self.volume_perturb(audio, text))
+        
+        return augmented_samples
+    
+    def add_noise(self, audio, text, snr_range=(10, 20)):
+        """添加背景噪音"""
+        samples = []
+        
+        # 加载噪音 (MUSAN 数据集)
+        noise_files = ["noise1.wav", "noise2.wav", "noise3.wav"]
+        
+        for noise_file in noise_files:
+            noise, _ = sf.read(noise_file)
+            
+            # 调整噪音长度
+            if len(noise) > len(audio):
+                noise = noise[:len(audio)]
+            else:
+                noise = np.pad(noise, (0, len(audio) - len(noise)))
+            
+            # 计算 SNR
+            snr = np.random.uniform(*snr_range)
+            audio_power = np.sum(audio ** 2) / len(audio)
+            noise_power = np.sum(noise ** 2) / len(noise)
+            noise_scaled = noise * np.sqrt(audio_power / (noise_power * (10 ** (snr / 10))))
+            
+            # 混合
+            noisy_audio = audio + noise_scaled
+            noisy_audio = noisy_audio / np.max(np.abs(noisy_audio))
+            
+            samples.append({
+                "audio": noisy_audio,
+                "text": text,
+                "augment": f"noise_snr{snr:.1f}"
+            })
+        
+        return samples
+    
+    def add_reverb(self, audio, text):
+        """添加混响 (使用 RIR)"""
+        samples = []
+        
+        # 加载房间冲激响应
+        rir_files = ["rir_room1.wav", "rir_room2.wav"]
+        
+        for rir_file in rir_files:
+            rir, _ = sf.read(rir_file)
+            
+            # 卷积
+            reverberated = signal.convolve(audio, rir, mode="full")
+            reverberated = reverberated[:len(audio)]
+            reverberated = reverberated / np.max(np.abs(reverberated))
+            
+            samples.append({
+                "audio": reverberated,
+                "text": text,
+                "augment": "reverb"
+            })
+        
+        return samples
+    
+    def speed_perturb(self, audio, text, speeds=[0.9, 1.0, 1.1]):
+        """速度扰动"""
+        samples = []
+        
+        for speed in speeds:
+            if speed == 1.0:
+                continue
+            
+            # 重采样实现速度变化
+            length = int(len(audio) / speed)
+            indices = np.linspace(0, len(audio) - 1, length).astype(int)
+            perturbed = audio[indices]
+            
+            samples.append({
+                "audio": perturbed,
+                "text": text,
+                "augment": f"speed_{speed}"
+            })
+        
+        return samples
+    
+    def volume_perturb(self, audio, text, db_range=(-3, 3)):
+        """音量扰动"""
+        samples = []
+        
+        db = np.random.uniform(*db_range)
+        scale = 10 ** (db / 20)
+        perturbed = audio * scale
+        perturbed = np.clip(perturbed, -1.0, 1.0)
+        
+        samples.append({
+            "audio": perturbed,
+            "text": text,
+            "augment": f"volume_{db:+.1f}dB"
+        })
+        
+        return samples
+
+# 使用示例
+aug = DataAugmentation()
+augmented_data = aug.augment(audio, text, augment_type="all")
+# 1 条原始数据 → 10+ 条增强数据
+```
+
+### 数据质量检查
+
+```python
+# 数据质量检查脚本
+class DataQualityChecker:
+    def __init__(self):
+        self.issues = []
+    
+    def check_all(self, annotations):
+        """全面检查"""
+        for ann in annotations:
+            self.check_audio(ann["audio"])
+            self.check_text(ann["text"])
+            self.check_consistency(ann)
+        
+        return self.issues
+    
+    def check_audio(self, audio_file):
+        """音频检查"""
+        try:
+            audio, sr = sf.read(audio_file)
+            
+            # 检查采样率
+            if sr != 16000:
+                self.issues.append({
+                    "file": audio_file,
+                    "issue": "wrong_sample_rate",
+                    "value": sr
+                })
+            
+            # 检查时长
+            duration = len(audio) / sr
+            if duration < 0.5:
+                self.issues.append({
+                    "file": audio_file,
+                    "issue": "too_short",
+                    "value": duration
+                })
+            if duration > 30:
+                self.issues.append({
+                    "file": audio_file,
+                    "issue": "too_long",
+                    "value": duration
+                })
+            
+            # 检查静音
+            if np.max(np.abs(audio)) < 0.01:
+                self.issues.append({
+                    "file": audio_file,
+                    "issue": "silent"
+                })
+        
+        except Exception as e:
+            self.issues.append({
+                "file": audio_file,
+                "issue": "unreadable",
+                "error": str(e)
+            })
+    
+    def check_text(self, text):
+        """文本检查"""
+        if len(text) < 2:
+            self.issues.append({
+                "text": text,
+                "issue": "too_short"
+            })
+        
+        # 检查特殊字符
+        if re.search(r"<.*?>", text):
+            self.issues.append({
+                "text": text,
+                "issue": "contains_tags"
+            })
+    
+    def check_consistency(self, ann):
+        """一致性检查"""
+        # 检查语言匹配
+        text = ann["text"]
+        chinese_ratio = sum(1 for c in text if '\u4e00' <= c <= '\u9fff') / len(text)
+        
+        if chinese_ratio > 0.8 and ann.get("language") == "en":
+            self.issues.append({
+                "file": ann["audio"],
+                "issue": "language_mismatch"
+            })
+    
+    def generate_report(self):
+        """生成质量报告"""
+        from collections import Counter
+        
+        issue_types = Counter(issue["issue"] for issue in self.issues)
+        
+        report = {
+            "total_issues": len(self.issues),
+            "by_type": dict(issue_types),
+            "details": self.issues
+        }
+        
+        return report
+```
+
+---
+
+## 评测数据构造方法
+
+### 测试集划分
+
+```python
+# 数据集划分脚本
+from sklearn.model_selection import train_test_split
+
+def split_dataset(annotations, output_dir):
+    """划分训练/验证/测试集"""
+    
+    # 按说话人划分 (确保说话人不重叠)
+    speakers = set(ann["speaker_id"] for ann in annotations)
+    
+    # 60% 训练，20% 验证，20% 测试
+    speakers_train, speakers_temp = train_test_split(
+        speakers, test_size=0.4, random_state=42
+    )
+    speakers_val, speakers_test = train_test_split(
+        list(speakers_temp), test_size=0.5, random_state=42
+    )
+    
+    # 分配数据
+    train_data = [a for a in annotations if a["speaker_id"] in speakers_train]
+    val_data = [a for a in annotations if a["speaker_id"] in speakers_val]
+    test_data = [a for a in annotations if a["speaker_id"] in speakers_test]
+    
+    # 保存
+    with open(f"{output_dir}/train.jsonl", "w") as f:
+        for a in train_data:
+            f.write(json.dumps(a, ensure_ascii=False) + "\n")
+    
+    with open(f"{output_dir}/val.jsonl", "w") as f:
+        for a in val_data:
+            f.write(json.dumps(a, ensure_ascii=False) + "\n")
+    
+    with open(f"{output_dir}/test.jsonl", "w") as f:
+        for a in test_data:
+            f.write(json.dumps(a, ensure_ascii=False) + "\n")
+    
+    print(f"训练集：{len(train_data)}, 验证集：{len(val_data)}, 测试集：{len(test_data)}")
+    
+    return train_data, val_data, test_data
+```
+
+### 评测场景设计
+
+```python
+# 评测场景构造
+class EvaluationScenarioBuilder:
+    def __init__(self):
+        self.scenarios = []
+    
+    def build_scenarios(self):
+        """构建评测场景"""
+        
+        # 1. 安静环境 (基准)
+        self.scenarios.append({
+            "name": "clean",
+            "description": "安静环境，无背景噪音",
+            "snr": None,
+            "reverb": False,
+            "min_samples": 100
+        })
+        
+        # 2. 轻度噪音
+        self.scenarios.append({
+            "name": "noise_slight",
+            "description": "轻度背景噪音 (咖啡厅)",
+            "snr": (20, 25),
+            "reverb": False,
+            "min_samples": 50
+        })
+        
+        # 3. 中度噪音
+        self.scenarios.append({
+            "name": "noise_moderate",
+            "description": "中度背景噪音 (办公室)",
+            "snr": (15, 20),
+            "reverb": False,
+            "min_samples": 50
+        })
+        
+        # 4. 重度噪音
+        self.scenarios.append({
+            "name": "noise_high",
+            "description": "重度背景噪音 (街道)",
+            "snr": (10, 15),
+            "reverb": False,
+            "min_samples": 50
+        })
+        
+        # 5. 混响环境
+        self.scenarios.append({
+            "name": "reverb",
+            "description": "混响环境 (会议室)",
+            "snr": None,
+            "reverb": True,
+            "min_samples": 50
+        })
+        
+        # 6. 中英混合
+        self.scenarios.append({
+            "name": "code_switching",
+            "description": "中英混合说话",
+            "language": "zh-en",
+            "min_samples": 50
+        })
+        
+        # 7. 短语音
+        self.scenarios.append({
+            "name": "short",
+            "description": "短语音 (<2 秒)",
+            "duration": (0.5, 2.0),
+            "min_samples": 50
+        })
+        
+        # 8. 长语音
+        self.scenarios.append({
+            "name": "long",
+            "description": "长语音 (>10 秒)",
+            "duration": (10.0, 30.0),
+            "min_samples": 50
+        })
+        
+        return self.scenarios
+    
+    def create_test_set(self, annotations, output_file):
+        """创建分场景测试集"""
+        test_sets = {s["name"]: [] for s in self.scenarios}
+        
+        for ann in annotations:
+            for scenario in self.scenarios:
+                if self.matches_scenario(ann, scenario):
+                    test_sets[scenario["name"]].append(ann)
+        
+        # 保存
+        with open(output_file, "w", encoding="utf-8") as f:
+            json.dump(test_sets, f, ensure_ascii=False, indent=2)
+        
+        # 统计
+        for name, samples in test_sets.items():
+            print(f"{name}: {len(samples)} 样本")
+        
+        return test_sets
+    
+    def matches_scenario(self, ann, scenario):
+        """判断样本是否符合场景"""
+        if "duration" in scenario:
+            if not (scenario["duration"][0] <= ann["duration"] <= scenario["duration"][1]):
+                return False
+        
+        if "language" in scenario:
+            if scenario["language"] == "zh-en":
+                text = ann["text"]
+                has_zh = any('\u4e00' <= c <= '\u9fff' for c in text)
+                has_en = any(c.isalpha() for c in text)
+                if not (has_zh and has_en):
+                    return False
+        
+        return True
+```
+
+---
+
+## 评测方法
+
+### 核心指标
+
+```python
+# ASR 评测指标计算
+import jiwer  # Joint Institute for Speech and Language Research
+
+class ASRMetrics:
+    def __init__(self):
+        self.results = []
+    
+    def calculate_all(self, references, hypotheses):
+        """
+        计算所有指标
+        
+        Args:
+            references: 真实标注列表
+            hypotheses: 识别结果列表
+        
+        Returns:
+            dict: 各项指标
+        """
+        # 1. 词错误率 (WER/CER)
+        wer = jiwer.wer(references, hypotheses)
+        cer = jiwer.cer(references, hypotheses)
+        
+        # 2. 字错误率 (中文专用)
+        cer_zh = self.calculate_cer_zh(references, hypotheses)
+        
+        # 3. 句子准确率
+        sentence_accuracy = self.calculate_sentence_accuracy(references, hypotheses)
+        
+        # 4. 置信度校准
+        calibration = self.calculate_calibration(references, hypotheses)
+        
+        return {
+            "wer": wer * 100,
+            "cer": cer * 100,
+            "cer_zh": cer_zh * 100,
+            "sentence_accuracy": sentence_accuracy * 100,
+            "calibration_ece": calibration
+        }
+    
+    def calculate_cer_zh(self, references, hypotheses):
+        """计算中文字错误率"""
+        total_errors = 0
+        total_chars = 0
+        
+        for ref, hyp in zip(references, hypotheses):
+            # 中文按字计算
+            ref_chars = list(ref.replace(" ", ""))
+            hyp_chars = list(hyp.replace(" ", ""))
+            
+            # 编辑距离
+            edits = jiwer.compute_measures(ref_chars, hyp_chars)
+            total_errors += edits["substitutions"] + edits["deletions"] + edits["insertions"]
+            total_chars += len(ref_chars)
+        
+        return total_errors / total_chars if total_chars > 0 else 0
+    
+    def calculate_sentence_accuracy(self, references, hypotheses):
+        """计算句子准确率"""
+        correct = sum(1 for ref, hyp in zip(references, hypotheses) if ref.strip() == hyp.strip())
+        return correct / len(references)
+    
+    def calculate_calibration(self, references, hypotheses, confidences=None):
+        """
+        计算置信度校准 (ECE: Expected Calibration Error)
+        
+        理想情况：置信度 0.9 的样本，准确率应接近 90%
+        """
+        if confidences is None:
+            return 0.0
+        
+        # 分桶
+        n_bins = 10
+        bins = np.linspace(0, 1, n_bins + 1)
+        
+        ece = 0.0
+        for i in range(n_bins):
+            mask = (confidences > bins[i]) & (confidences <= bins[i+1])
+            if mask.sum() == 0:
+                continue
+            
+            # 桶内准确率
+            bin_correct = sum(1 for r, h in zip(references[mask], hypotheses[mask]) if r == h)
+            bin_acc = bin_correct / mask.sum()
+            
+            # 平均置信度
+            bin_conf = confidences[mask].mean()
+            
+            # 校准误差
+            ece += mask.sum() / len(confidences) * abs(bin_acc - bin_conf)
+        
+        return ece
+
+# 使用示例
+metrics = ASRMetrics()
+results = metrics.calculate_all(
+    references=["你好世界", "今天天气不错"],
+    hypotheses=["你好世界", "今天天气不好"]
+)
+print(f"CER: {results['cer_zh']:.2f}%")
+```
+
+### 分场景评测
+
+```python
+# 分场景评测脚本
+class ScenarioEvaluator:
+    def __init__(self, asr_model):
+        self.asr_model = asr_model
+        self.metrics = ASRMetrics()
+    
+    def evaluate_by_scenario(self, test_sets):
+        """分场景评测"""
+        results = {}
+        
+        for scenario_name, samples in test_sets.items():
+            print(f"\n评测场景：{scenario_name}")
+            
+            references = [s["text"] for s in samples]
+            hypotheses = []
+            confidences = []
+            
+            # 批量识别
+            for sample in samples:
+                result = self.asr_model.transcribe([sample["audio"]])
+                hypotheses.append(result[0]["text"])
+                confidences.append(result[0]["confidence"])
+            
+            # 计算指标
+            scenario_results = self.metrics.calculate_all(
+                references, hypotheses, confidences
+            )
+            
+            results[scenario_name] = scenario_results
+            
+            # 打印
+            print(f"  CER: {scenario_results['cer_zh']:.2f}%")
+            print(f"  句子准确率：{scenario_results['sentence_accuracy']:.2f}%")
+            print(f"  校准误差：{scenario_results['calibration_ece']:.4f}")
+        
+        return results
+    
+    def generate_report(self, results, output_file):
+        """生成评测报告"""
+        report = {
+            "summary": {
+                "avg_cer": np.mean([r["cer_zh"] for r in results.values()]),
+                "avg_accuracy": np.mean([r["sentence_accuracy"] for r in results.values()])
+            },
+            "by_scenario": results,
+            "worst_case": min(results.items(), key=lambda x: x[1]["cer_zh"]),
+            "best_case": min(results.items(), key=lambda x: x[1]["cer_zh"])
+        }
+        
+        with open(output_file, "w", encoding="utf-8") as f:
+            json.dump(report, f, ensure_ascii=False, indent=2)
+        
+        return report
+```
+
+### 人工评测 (MOS)
+
+```python
+# 人工评测界面
+class ManualEvaluationTool:
+    def __init__(self):
+        self.ratings = []
+    
+    def create_interface(self):
+        """创建 MOS 评测界面"""
+        with gr.Blocks() as demo:
+            gr.Markdown("# ASR 人工评测 (MOS)")
+            
+            with gr.Row():
+                # 音频播放
+                original_audio = gr.Audio(label="原始音频")
+                asr_audio = gr.Audio(label="ASR 识别后合成")
+            
+            # 真实文本 vs 识别文本
+            with gr.Row():
+                ref_text = gr.Textbox(label="真实文本")
+                hyp_text = gr.Textbox(label="识别文本")
+            
+            # 评分
+            mos_score = gr.Slider(
+                minimum=1, maximum=5, step=1,
+                label="MOS 评分 (1=很差，5=完美)"
+            )
+            
+            # 错误类型标注
+            error_types = gr.CheckboxGroup(
+                choices=[
+                    "替换错误",
+                    "删除错误",
+                    "插入错误",
+                    "专有名词错误",
+                    "同音字错误",
+                    "其他"
+                ],
+                label="错误类型"
+            )
+            
+            # 备注
+            comments = gr.Textbox(label="备注", placeholder="其他问题...")
+            
+            # 提交
+            submit_btn = gr.Button("提交评分", variant="primary")
+        
+        return demo
+    
+    def save_rating(self, audio_id, mos, error_types, comments):
+        """保存评分"""
+        rating = {
+            "audio_id": audio_id,
+            "mos": mos,
+            "error_types": error_types,
+            "comments": comments,
+            "timestamp": datetime.now().isoformat()
+        }
+        
+        self.ratings.append(rating)
+        
+        with open("mos_ratings.jsonl", "a") as f:
+            f.write(json.dumps(rating) + "\n")
+        
+        return f"已保存，当前：{len(self.ratings)} 条"
+```
+
+### 评测报告生成
+
+```python
+# 评测报告生成器
+class EvaluationReportGenerator:
+    def __init__(self, results):
+        self.results = results
+    
+    def generate_markdown_report(self, output_file):
+        """生成 Markdown 评测报告"""
+        
+        report = f"""# FireRedASR 评测报告
+
+生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+## 总体表现
+
+| 指标 | 数值 |
+|------|------|
+| 平均 CER | {self.results['summary']['avg_cer']:.2f}% |
+| 平均句子准确率 | {self.results['summary']['avg_accuracy']:.2f}% |
+
+## 分场景表现
+
+| 场景 | CER | 句子准确率 | 校准误差 |
+|------|-----|-----------|---------|
+"""
+        
+        for scenario, metrics in self.results['by_scenario'].items():
+            report += f"| {scenario} | {metrics['cer_zh']:.2f}% | {metrics['sentence_accuracy']:.2f}% | {metrics['calibration_ece']:.4f} |\n"
+        
+        report += f"""
+## 最佳/最差场景
+
+- **最佳场景**: {self.results['best_case'][0]} (CER: {self.results['best_case'][1]['cer_zh']:.2f}%)
+- **最差场景**: {self.results['worst_case'][0]} (CER: {self.results['worst_case'][1]['cer_zh']:.2f}%)
+
+## 改进建议
+
+1. 针对最差场景进行数据增强
+2. 优化置信度校准
+3. 增加专有名词识别训练
+"""
+        
+        with open(output_file, "w", encoding="utf-8") as f:
+            f.write(report)
+        
+        return report
+```
+
+---
+
 ## 推理流程
 
 ### 完整推理链路
